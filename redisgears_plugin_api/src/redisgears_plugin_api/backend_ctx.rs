@@ -12,6 +12,7 @@ use crate::redisgears_plugin_api::load_library_ctx::LibraryCtxInterface;
 use crate::redisgears_plugin_api::redisai_interface::AITensorInterface;
 use crate::redisgears_plugin_api::GearsApiError;
 
+use super::load_library_ctx::ModuleInfo;
 use super::prologue::ApiVersion;
 
 pub trait CompiledLibraryInterface {
@@ -44,11 +45,12 @@ pub struct BackendCtx {
     pub log_error: Box<dyn Fn(&str) + 'static>,
     pub get_on_oom_policy: Box<dyn Fn() -> LibraryFatalFailurePolicy + 'static>,
     pub get_lock_timeout: Box<dyn Fn() -> u128 + 'static>,
+    pub get_rdb_lock_timeout: Box<dyn Fn() -> u128 + 'static>,
     pub get_v8_maxmemory: Box<dyn Fn() -> usize + 'static>,
     pub get_v8_library_initial_memory: Box<dyn Fn() -> usize + 'static>,
     pub get_v8_library_initial_memory_limit: Box<dyn Fn() -> usize + 'static>,
     pub get_v8_library_memory_delta: Box<dyn Fn() -> usize + 'static>,
-    pub get_v8_flags: Box<dyn Fn() -> String>,
+    pub get_v8_flags: Box<dyn Fn() -> String + 'static>,
 }
 
 /// The trait which is only implemented for a successfully initialised
@@ -64,16 +66,23 @@ pub trait BackendCtxInterfaceInitialised {
         compiled_library_api: Box<dyn CompiledLibraryInterface + Send + Sync>,
     ) -> Result<Box<dyn LibraryCtxInterface>, GearsApiError>;
     fn debug(&mut self, args: &[&str]) -> Result<RedisValue, GearsApiError>;
+    fn get_info(&mut self) -> Option<ModuleInfo>;
 }
 
 pub trait BackendCtxInterfaceUninitialised {
     /// Returns the name of the backend.
     fn get_name(&self) -> &'static str;
 
+    /// This callback will be called on loading phase to allow
+    /// the backend to perform minimal operation that must be done
+    /// on loading phase. The backend should only perform the minimal
+    /// needed operation and should avoid any resources allocation
+    /// like thread or network.
+    fn on_load(&self, backend_ctx: BackendCtx) -> Result<(), GearsApiError>;
+
     /// Initialises the backend with the information passed and returns
     /// a successfully initialised instance.
     fn initialize(
         self: Box<Self>,
-        backend_ctx_info: BackendCtx,
     ) -> Result<Box<dyn BackendCtxInterfaceInitialised>, GearsApiError>;
 }

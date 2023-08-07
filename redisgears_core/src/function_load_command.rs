@@ -5,12 +5,13 @@
  */
 
 use redis_module::{
-    Context, NextArg, RedisError, RedisResult, RedisString, RedisValue, ThreadSafeContext,
+    Context, ContextFlags, NextArg, RedisError, RedisResult, RedisString, RedisValue,
+    ThreadSafeContext,
 };
 use redisgears_plugin_api::redisgears_plugin_api::GearsApiError;
 
 use crate::compiled_library_api::CompiledLibraryAPI;
-use crate::{get_backend, verify_name, Deserialize, Serialize};
+use crate::{get_backend, get_globals, verify_name, Deserialize, Serialize};
 
 use crate::{
     get_libraries, GearsLibrary, GearsLibraryCtx, GearsLibraryMetaData, GearsLoadLibraryCtx,
@@ -47,7 +48,7 @@ fn library_extract_metadata(
     let prologue = redisgears_plugin_api::redisgears_plugin_api::prologue::parse_prologue(code)
         .map_err(|e| RedisError::String(GearsApiError::from(e).get_msg().to_owned()))?;
 
-    verify_name(&prologue.library_name).map_err(|e| {
+    verify_name(prologue.library_name).map_err(|e| {
         RedisError::String(format!(
             "Unallowed library name '{}', {e}.",
             prologue.library_name
@@ -98,6 +99,7 @@ pub(crate) fn function_load_internal(
     code: &str,
     config: Option<String>,
     upgrade: bool,
+    is_loading_rdb: bool,
 ) -> Result<(), String> {
     let meta_data = library_extract_metadata(code, config, user).map_err(|e| e.to_string())?;
     let backend_name = meta_data.engine.as_str();
@@ -111,10 +113,7 @@ pub(crate) fn function_load_internal(
         meta_data.config.as_ref(),
         Box::new(compile_lib_ctx),
     );
-    let lib_ctx = match lib_ctx {
-        Err(e) => return Err(format!("Failed library compilation: {}", e.get_msg())),
-        Ok(lib_ctx) => lib_ctx,
-    };
+    let lib_ctx = lib_ctx.map_err(|e| format!("Failed library compilation: {}", e.get_msg()))?;
     let mut libraries = get_libraries();
     let old_lib = libraries.remove(&meta_data.name);
     if !upgrade {
@@ -134,31 +133,34 @@ pub(crate) fn function_load_internal(
         revert_notifications_consumers: Vec::new(),
         old_lib,
     };
-    let res = lib_ctx.load_library(&GearsLoadLibraryCtx {
-        ctx,
-        gears_lib_ctx: &mut gears_library,
-    });
+    let res = lib_ctx.load_library(
+        &GearsLoadLibraryCtx {
+            ctx,
+            gears_lib_ctx: &mut gears_library,
+        },
+        is_loading_rdb,
+    );
     if let Err(err) = res {
-        let ret = Err(format!(
+        function_load_revert(gears_library, &mut libraries);
+
+        return Err(format!(
             "Failed loading library: {}.",
             get_msg_verbose(&err)
         ));
-        function_load_revert(gears_library, &mut libraries);
-        return ret;
     }
     if gears_library.functions.is_empty()
         && gears_library.stream_consumers.is_empty()
         && gears_library.notifications_consumers.is_empty()
     {
         function_load_revert(gears_library, &mut libraries);
-        return Err("No function nor registrations was registered".to_string());
+        return Err("Neither function nor other registrations were found.".to_owned());
     }
     gears_library.old_lib = None;
     libraries.insert(
         gears_library.meta_data.name.to_string(),
         Arc::new(GearsLibrary {
             gears_lib_ctx: gears_library,
-            _lib_ctx: lib_ctx,
+            lib_ctx,
             compile_lib_internals,
         }),
     );
@@ -276,6 +278,7 @@ impl RemoteTask for GearsFunctionLoadRemoteTask {
                 &r.args.code,
                 r.args.config.clone(),
                 r.args.upgrade,
+                false,
             );
             if res.is_ok() {
                 let mut replicate_args = Vec::new();
@@ -328,10 +331,32 @@ pub(crate) fn function_load_command(
     Ok(RedisValue::NoReply)
 }
 
+/// Verify that it is OK to perform an internal command.
+/// Internal command should only run if it came from replication stream
+/// or from AOF loading. In other words, the command did not came directly from a user.
+fn verify_internal_command(ctx: &Context) -> Result<(), RedisError> {
+    let flags = ctx.get_flags();
+    let globals = get_globals();
+    if !flags.contains(ContextFlags::LOADING)
+        && !(flags.contains(ContextFlags::REPLICATED) || globals.db_policy.is_pseudo_slave())
+    {
+        // Internal commands should either be loaded from AOF ([`ContextFlags::LOADING`])
+        // or sent over the replication stream([`ContextFlags::REPLICATED`]).
+        // Another special option is if the instance is pseudo slave (replica of) which is treated as if the command was replicated from primary.
+        // If none of those cases holds we will return an error.
+        return Err(RedisError::Str(
+            "Internal command should only be sent from primary or loaded from AOF",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn function_load_on_replica(
     ctx: &Context,
     args: Skip<IntoIter<redis_module::RedisString>>,
 ) -> RedisResult {
+    verify_internal_command(ctx)?;
+
     let args = get_args_values(args)?;
     if args.user.is_none() {
         return Err(RedisError::Str("User was not provided by primary"));
@@ -342,6 +367,7 @@ pub(crate) fn function_load_on_replica(
         &args.code,
         args.config,
         args.upgrade,
+        true,
     ) {
         Ok(_) => Ok(RedisValue::SimpleStringStatic("OK")),
         Err(e) => Err(RedisError::String(e)),

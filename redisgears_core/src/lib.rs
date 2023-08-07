@@ -17,15 +17,18 @@ use redis_module::{
     PromiseCallReply, RedisGILGuard,
 };
 use redisgears_plugin_api::redisgears_plugin_api::backend_ctx::BackendCtxInterfaceInitialised;
-use redisgears_plugin_api::redisgears_plugin_api::load_library_ctx::FunctionFlags;
+use redisgears_plugin_api::redisgears_plugin_api::load_library_ctx::{
+    FunctionFlags, InfoSectionData, ModuleInfo,
+};
 use redisgears_plugin_api::redisgears_plugin_api::prologue::ApiVersion;
 use redisgears_plugin_api::redisgears_plugin_api::run_function_ctx::PromiseReply;
 use serde::{Deserialize, Serialize};
 
 use config::{
-    FatalFailurePolicyConfiguration, ENABLE_DEBUG_COMMAND, ERROR_VERBOSITY, EXECUTION_THREADS,
-    FATAL_FAILURE_POLICY, LOCK_REDIS_TIMEOUT, V8_FLAGS, V8_LIBRARY_INITIAL_MEMORY_LIMIT,
-    V8_LIBRARY_INITIAL_MEMORY_USAGE, V8_LIBRARY_MEMORY_USAGE_DELTA, V8_MAX_MEMORY, V8_PLUGIN_PATH,
+    FatalFailurePolicyConfiguration, DB_LOADING_LOCK_REDIS_TIMEOUT, ENABLE_DEBUG_COMMAND,
+    ERROR_VERBOSITY, EXECUTION_THREADS, FATAL_FAILURE_POLICY, LOCK_REDIS_TIMEOUT, V8_FLAGS,
+    V8_LIBRARY_INITIAL_MEMORY_LIMIT, V8_LIBRARY_INITIAL_MEMORY_USAGE,
+    V8_LIBRARY_MEMORY_USAGE_DELTA, V8_MAX_MEMORY, V8_PLUGIN_PATH,
 };
 
 use redis_module::raw::RedisModule__Assert;
@@ -42,7 +45,8 @@ use redis_module::server_events::{
 };
 use redis_module_macros::{
     command, config_changed_event_handler, cron_event_handler, flush_event_handler,
-    loading_event_handler, module_changed_event_handler, role_changed_event_handler,
+    info_command_handler, loading_event_handler, module_changed_event_handler,
+    role_changed_event_handler,
 };
 
 use redisgears_plugin_api::redisgears_plugin_api::{
@@ -137,6 +141,48 @@ fn check_redis_version_compatible(ctx: &Context) -> Result<(), String> {
     Ok(())
 }
 
+/// A string converted into a sha256 hash-sum. The string is unique
+/// per the source string, due to the hash algorithm used.
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[repr(transparent)]
+struct ObfuscatedString(String);
+impl ObfuscatedString {
+    fn new<S: Into<String>>(non_obfuscated: S) -> Self {
+        Self(sha256::digest(non_obfuscated.into()))
+    }
+}
+impl std::ops::Deref for ObfuscatedString {
+    type Target = String;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for ObfuscatedString {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<T: AsRef<str>> From<T> for ObfuscatedString {
+    fn from(value: T) -> Self {
+        Self::new(value.as_ref())
+    }
+}
+
+trait ObfuscateString {
+    fn obfuscate(&self) -> ObfuscatedString;
+}
+
+impl<T> ObfuscateString for T
+where
+    T: AsRef<str>,
+{
+    fn obfuscate(&self) -> ObfuscatedString {
+        self.into()
+    }
+}
+
 /// The meta information about the gears library instance at runtime.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct GearsLibraryMetaData {
@@ -195,7 +241,7 @@ struct GearsLoadLibraryCtx<'ctx, 'lib_ctx> {
 
 struct GearsLibrary {
     gears_lib_ctx: GearsLibraryCtx,
-    _lib_ctx: Box<dyn LibraryCtxInterface>,
+    lib_ctx: Box<dyn LibraryCtxInterface>,
     compile_lib_internals: Arc<CompiledLibraryInternals>,
 }
 
@@ -468,24 +514,15 @@ enum DbPolicy {
 
 impl DbPolicy {
     pub(crate) fn is_regular(&self) -> bool {
-        match self {
-            DbPolicy::Regular => true,
-            _ => false,
-        }
+        matches!(self, DbPolicy::Regular)
     }
 
     pub(crate) fn is_readonly(&self) -> bool {
-        match self {
-            DbPolicy::PseudoSlaveReadonly => true,
-            _ => false,
-        }
+        matches!(self, DbPolicy::PseudoSlaveReadonly)
     }
 
     pub(crate) fn is_pseudo_slave(&self) -> bool {
-        match self {
-            DbPolicy::PseudoSlaveReadonly | DbPolicy::PseudoSlave => true,
-            _ => false,
-        }
+        matches!(self, DbPolicy::PseudoSlaveReadonly | DbPolicy::PseudoSlave)
     }
 }
 
@@ -510,16 +547,21 @@ struct GlobalCtx {
 
 static mut GLOBALS: Option<GlobalCtx> = None;
 
-pub(crate) struct NotificationBlocker;
+pub(crate) struct NotificationBlocker {
+    old_val: bool,
+}
 
 pub(crate) fn get_notification_blocker() -> NotificationBlocker {
+    let res = NotificationBlocker {
+        old_val: get_globals_mut().avoid_key_space_notifications,
+    };
     get_globals_mut().avoid_key_space_notifications = true;
-    NotificationBlocker
+    res
 }
 
 impl Drop for NotificationBlocker {
     fn drop(&mut self) {
-        get_globals_mut().avoid_key_space_notifications = false;
+        get_globals_mut().avoid_key_space_notifications = self.old_val;
     }
 }
 
@@ -591,16 +633,19 @@ pub(crate) fn call_redis_command(
     args: &[&[u8]],
 ) -> CallResult<'static> {
     let _authenticate_scope = ctx
-        .autenticate_user(user)
+        .authenticate_user(user)
         .map_err(|e| ErrorReply::Message(e.to_string()))?;
     ctx.call_ext(command, call_options, args)
 }
 
+type FutureHandlerContextCallback = dyn FnOnce(&Context, CallResult<'static>);
+type FutureHandlerContextDisposer = dyn FnOnce(&Context, bool);
+
 /// a struct that holds information about not yet resolve future replies.
 /// The struct allows to either abort the execution or invoke the on done callback.
 struct FutureHandlerContext {
-    callback: Option<Box<dyn FnOnce(&Context, CallResult<'static>)>>,
-    disposer: Option<Box<dyn FnOnce(&Context, bool)>>,
+    callback: Option<Box<FutureHandlerContextCallback>>,
+    disposer: Option<Box<FutureHandlerContextDisposer>>,
     command: Vec<Vec<u8>>,
 }
 
@@ -611,20 +656,27 @@ impl FutureHandlerContext {
         ctx: &Context,
         reply: Result<redis_module::CallReply<'static>, ErrorReply<'static>>,
     ) {
-        self.callback.take().map(|f| f(ctx, reply));
-        self.disposer.take().map(|f| f(ctx, false));
+        if let Some(callback) = self.callback.take() {
+            callback(ctx, reply);
+        }
+
+        if let Some(disposer) = self.disposer.take() {
+            disposer(ctx, false);
+        }
     }
 
     /// Abort the command invocation (if possible) and send an error as a reply to the
     /// on done callback.
     fn abort(&mut self, ctx: &Context) {
-        self.callback.take().map(|f| {
-            f(
+        if let Some(callback) = self.callback.take() {
+            callback(
                 ctx,
                 CallResult::Err(ErrorReply::Message("Command was aborted".to_owned())),
-            )
-        });
-        self.disposer.take().map(|f| f(ctx, true));
+            );
+        }
+        if let Some(disposer) = self.disposer.take() {
+            disposer(ctx, true);
+        }
     }
 }
 
@@ -642,7 +694,7 @@ pub(crate) fn call_redis_command_async<'ctx>(
     args: &[&[u8]],
 ) -> PromiseReply<'static, 'ctx> {
     let _authenticate_scope = ctx
-        .autenticate_user(user)
+        .authenticate_user(user)
         .map_err(|e| ErrorReply::Message(e.to_string()));
     if let Err(e) = _authenticate_scope {
         return PromiseReply::Resolved(CallResult::Err(e));
@@ -658,7 +710,7 @@ pub(crate) fn call_redis_command_async<'ctx>(
                 let future_handler_context = FutureHandlerContext {
                     callback: Some(callback),
                     disposer: None,
-                    command: command,
+                    command,
                 };
                 let future_handler_context = Arc::new(RedisGILGuard::new(future_handler_context));
                 let future_handler_context_unblocked = Arc::clone(&future_handler_context);
@@ -791,13 +843,10 @@ fn load_v8_backend(
 
     let lib = unsafe { Library::new(&v8_path) }
         .map_err(|e| RedisError::String(format!("Failed loading '{}', {}", v8_path, e)))?;
-    let func: Symbol<unsafe fn(&Context) -> *mut dyn BackendCtxInterfaceUninitialised> =
-        unsafe { lib.get(b"initialize_plugin") }.map_err(|e| {
-            RedisError::String(format!(
-                "Failed getting initialize_plugin symbol, {}",
-                e.to_string()
-            ))
-        })?;
+    let func: Symbol<unsafe fn(&Context) -> *mut dyn BackendCtxInterfaceUninitialised> = unsafe {
+        lib.get(b"initialize_plugin")
+    }
+    .map_err(|e| RedisError::String(format!("Failed getting initialize_plugin symbol, {e}")))?;
     let backend = unsafe { Box::from_raw(func(ctx)) };
     let name = backend.get_name();
     log::info!("Registered backend: {name}.");
@@ -805,37 +854,12 @@ fn load_v8_backend(
 }
 
 fn initialize_v8_backend(
-    ctx: &Context,
+    _ctx: &Context,
     uninitialised_backend: Box<dyn BackendCtxInterfaceUninitialised>,
 ) -> Result<Box<dyn BackendCtxInterfaceInitialised>, RedisError> {
-    let v8_flags: String = V8_FLAGS.lock(ctx).to_owned();
     let name = uninitialised_backend.get_name();
-    let initialised_backend: Box<dyn BackendCtxInterfaceInitialised> = uninitialised_backend
-        .initialize(BackendCtx {
-            allocator: &RedisAlloc,
-            log_info: Box::new(|msg| log::info!("{msg}")),
-            log_trace: Box::new(|msg| log::trace!("{msg}")),
-            log_debug: Box::new(|msg| log::debug!("{msg}")),
-            log_error: Box::new(|msg| log::error!("{msg}")),
-            log_warning: Box::new(|msg| log::warn!("{msg}")),
-            get_on_oom_policy: Box::new(|| match *FATAL_FAILURE_POLICY.lock().unwrap() {
-                FatalFailurePolicyConfiguration::Abort => LibraryFatalFailurePolicy::Abort,
-                FatalFailurePolicyConfiguration::Kill => LibraryFatalFailurePolicy::Kill,
-            }),
-            get_lock_timeout: Box::new(|| LOCK_REDIS_TIMEOUT.load(Ordering::Relaxed) as u128),
-            get_v8_maxmemory: Box::new(|| V8_MAX_MEMORY.load(Ordering::Relaxed) as usize),
-            get_v8_library_initial_memory: Box::new(|| {
-                V8_LIBRARY_INITIAL_MEMORY_USAGE.load(Ordering::Relaxed) as usize
-            }),
-            get_v8_library_initial_memory_limit: Box::new(|| {
-                V8_LIBRARY_INITIAL_MEMORY_LIMIT.load(Ordering::Relaxed) as usize
-            }),
-            get_v8_library_memory_delta: Box::new(|| {
-                V8_LIBRARY_MEMORY_USAGE_DELTA.load(Ordering::Relaxed) as usize
-            }),
-            get_v8_flags: Box::new(move || v8_flags.to_owned()),
-        })
-        .map_err(|e| {
+    let initialised_backend: Box<dyn BackendCtxInterfaceInitialised> =
+        uninitialised_backend.initialize().map_err(|e| {
             RedisError::String(format!("Failed loading {} backend, {}.", name, e.get_msg()))
         })?;
     let version = initialised_backend.get_version();
@@ -849,7 +873,7 @@ pub(crate) fn get_backend(
 ) -> Result<&'static mut Box<dyn BackendCtxInterfaceInitialised>, RedisError> {
     get_backends_mut()
         .get_mut(name)
-        .ok_or_else(|| RedisError::Str("No such backend"))
+        .ok_or(RedisError::Str("No such backend"))
         .or_else(|_| {
             let uninitialised_backend = get_uninitialised_backends_mut()
                 .remove(name)
@@ -913,6 +937,41 @@ fn js_init(ctx: &Context, _args: &[RedisString]) -> Status {
             return Status::Err;
         }
     };
+
+    let v8_flags = V8_FLAGS.lock(ctx).to_owned();
+    let backend_ctx = BackendCtx {
+        allocator: &RedisAlloc,
+        log_info: Box::new(|msg| log::info!("{msg}")),
+        log_trace: Box::new(|msg| log::trace!("{msg}")),
+        log_debug: Box::new(|msg| log::debug!("{msg}")),
+        log_error: Box::new(|msg| log::error!("{msg}")),
+        log_warning: Box::new(|msg| log::warn!("{msg}")),
+        get_on_oom_policy: Box::new(|| match *FATAL_FAILURE_POLICY.lock().unwrap() {
+            FatalFailurePolicyConfiguration::Abort => LibraryFatalFailurePolicy::Abort,
+            FatalFailurePolicyConfiguration::Kill => LibraryFatalFailurePolicy::Kill,
+        }),
+        get_lock_timeout: Box::new(|| LOCK_REDIS_TIMEOUT.load(Ordering::Relaxed) as u128),
+        get_rdb_lock_timeout: Box::new(|| {
+            DB_LOADING_LOCK_REDIS_TIMEOUT.load(Ordering::Relaxed) as u128
+        }),
+        get_v8_maxmemory: Box::new(|| V8_MAX_MEMORY.load(Ordering::Relaxed) as usize),
+        get_v8_library_initial_memory: Box::new(|| {
+            V8_LIBRARY_INITIAL_MEMORY_USAGE.load(Ordering::Relaxed) as usize
+        }),
+        get_v8_library_initial_memory_limit: Box::new(|| {
+            V8_LIBRARY_INITIAL_MEMORY_LIMIT.load(Ordering::Relaxed) as usize
+        }),
+        get_v8_library_memory_delta: Box::new(|| {
+            V8_LIBRARY_MEMORY_USAGE_DELTA.load(Ordering::Relaxed) as usize
+        }),
+        get_v8_flags: Box::new(move || v8_flags.to_owned()),
+    };
+
+    let on_load_res = v8_backend.on_load(backend_ctx);
+    if let Err(e) = on_load_res {
+        log::error!("{e}");
+        return Status::Err;
+    }
     let global_ctx = GlobalCtx {
         libraries: Mutex::new(HashMap::new()),
         backends: HashMap::new(),
@@ -947,25 +1006,29 @@ fn js_init(ctx: &Context, _args: &[RedisString]) -> Status {
                     ctx.log_warning("Attempt to trim data on replica was denied.");
                     return;
                 }
-                let stream_name = ctx.create_string(key_name);
-                let key = ctx.open_key_writable(&stream_name);
-                let res = key.trim_stream_by_id(id, false);
-                if let Err(e) = res {
-                    ctx.log_debug(&format!(
-                        "Error occured when trimming stream (stream was probably deleted): {}",
-                        e
-                    ))
-                } else {
-                    redis_module::replicate(
-                        ctx.ctx,
-                        "xtrim",
-                        &[
-                            key_name,
-                            "MINID".as_bytes(),
-                            format!("{}-{}", id.ms, id.seq).as_bytes(),
-                        ],
-                    );
-                }
+                let stream_name = RedisString::create(None, key_name);
+                // We need to run inside a post execution job to make sure the trim
+                // will happened last and will be replicated to the replica last.
+                ctx.add_post_notification_job(move |ctx| {
+                    let key = ctx.open_key_writable(&stream_name);
+                    let res = key.trim_stream_by_id(id, false);
+                    if let Err(e) = res {
+                        ctx.log_debug(&format!(
+                            "Error occured when trimming stream (stream was probably deleted): {}",
+                            e
+                        ))
+                    } else {
+                        redis_module::replicate(
+                            ctx.ctx,
+                            "xtrim",
+                            &[
+                                stream_name.as_slice(),
+                                "MINID".as_bytes(),
+                                format!("{}-{}", id.ms, id.seq).as_bytes(),
+                            ],
+                        );
+                    }
+                });
             }),
         ),
         notifications_ctx: KeysNotificationsCtx::new(),
@@ -981,7 +1044,172 @@ fn js_init(ctx: &Context, _args: &[RedisString]) -> Status {
     Status::Ok
 }
 
-const fn js_info(_ctx: &InfoContext, _for_crash_report: bool) {}
+fn build_uninitialised_backends_info(ctx: &InfoContext) -> RedisResult<()> {
+    if get_uninitialised_backends_mut().is_empty() {
+        return Ok(());
+    }
+
+    let mut section_builder = ctx.builder().add_section("UninitialisedBackends");
+
+    section_builder = get_uninitialised_backends_mut()
+        .keys()
+        .try_fold(section_builder, |section_builder, name| {
+            section_builder.field("backend_name", name.as_str())
+        })?;
+
+    let _ = section_builder.build_section()?.build_info()?;
+
+    Ok(())
+}
+
+fn build_backend_module_info(ctx: &InfoContext, info: ModuleInfo) -> RedisResult<()> {
+    let mut builder = ctx.builder();
+    for section in &info.sections {
+        let mut section_builder = builder.add_section(section.0);
+        match section.1 {
+            InfoSectionData::KeyValuePairs(map) => {
+                for (key, value) in map {
+                    section_builder = section_builder.field(key, value.as_str())?;
+                }
+            }
+            InfoSectionData::Dictionaries(dictionaries) => {
+                for dictionary in dictionaries {
+                    let mut dictionary_builder = section_builder.add_dictionary(dictionary.0);
+                    for (key, value) in dictionary.1 {
+                        dictionary_builder = dictionary_builder.field(key, value.as_str())?;
+                    }
+                    section_builder = dictionary_builder.build_dictionary()?;
+                }
+            }
+        }
+        builder = section_builder.build_section()?;
+    }
+
+    let _ = builder.build_info()?;
+
+    Ok(())
+}
+
+fn build_initialised_backends_info(ctx: &InfoContext) -> RedisResult<()> {
+    get_backends_mut()
+        .values_mut()
+        .filter_map(|b| b.get_info())
+        .try_for_each(|info| build_backend_module_info(ctx, info))
+}
+
+fn build_per_library_info(ctx: &InfoContext) -> RedisResult<()> {
+    let libraries = get_globals().libraries.lock()?;
+    if libraries.is_empty() {
+        return Ok(());
+    }
+
+    let builder = ctx.builder();
+    let section_builder = builder.add_section("PerLibraryInformation");
+    let mut dictionaries = HashMap::new();
+    for library in libraries.iter() {
+        let mut library_info = HashMap::new();
+
+        library_info.insert(
+            "function_count(sync)".to_owned(),
+            library
+                .1
+                .gears_lib_ctx
+                .functions
+                .iter()
+                .filter(|f| !f.1.is_async)
+                .count()
+                .to_string(),
+        );
+
+        library_info.insert(
+            "function_count(async)".to_owned(),
+            library
+                .1
+                .gears_lib_ctx
+                .functions
+                .iter()
+                .filter(|f| f.1.is_async)
+                .count()
+                .to_string(),
+        );
+
+        library_info.insert(
+            "notification_consumers_count".to_owned(),
+            library
+                .1
+                .gears_lib_ctx
+                .notifications_consumers
+                .len()
+                .to_string(),
+        );
+
+        library_info.insert(
+            "stream_consumers_count".to_owned(),
+            library.1.gears_lib_ctx.stream_consumers.len().to_string(),
+        );
+
+        library_info.insert(
+            "api_version".to_owned(),
+            library.1.gears_lib_ctx.meta_data.api_version.to_string(),
+        );
+
+        library_info.insert(
+            "pending_jobs_count".to_owned(),
+            library.1.compile_lib_internals.pending_jobs().to_string(),
+        );
+
+        library_info.insert(
+            "pending_async_calls_count".to_owned(),
+            get_globals()
+                .future_handlers
+                .get(&library.1.gears_lib_ctx.meta_data.name)
+                .iter()
+                .count()
+                .to_string(),
+        );
+
+        library_info.insert(
+            "cluster_functions_count".to_owned(),
+            library.1.gears_lib_ctx.remote_functions.len().to_string(),
+        );
+
+        if let Some(info) = library.1.lib_ctx.get_info() {
+            if let Some(first_level) = info.sections.into_iter().next() {
+                if let InfoSectionData::KeyValuePairs(key_value_pairs) = first_level.1 {
+                    library_info.extend(key_value_pairs);
+                }
+            }
+        }
+
+        dictionaries.insert(library.0.obfuscate(), library_info);
+    }
+
+    let section_builder =
+        dictionaries
+            .into_iter()
+            .try_fold(section_builder, |section_builder, d| {
+                let mut dictionaries_builder = section_builder.add_dictionary(&d.0);
+
+                for (k, v) in d.1 {
+                    dictionaries_builder = dictionaries_builder.field(&k, v)?;
+                }
+
+                dictionaries_builder.build_dictionary()
+            })?;
+
+    let _ = section_builder.build_section()?.build_info()?;
+
+    Ok(())
+}
+
+#[info_command_handler]
+fn module_info(ctx: &InfoContext, _for_crash_report: bool) -> RedisResult<()> {
+    build_uninitialised_backends_info(ctx)?;
+    build_initialised_backends_info(ctx)?;
+    build_per_library_info(ctx)?;
+
+    Ok(())
+}
 
 /// Verifies that we haven't reached an Out Of Memory situation.
 /// Returns `true` if the OOM isn't reached.
@@ -1017,7 +1245,7 @@ fn function_call_command(
     mut args: Skip<IntoIter<redis_module::RedisString>>,
     allow_block: bool,
 ) -> RedisResult {
-    let mut lib_func_name = args.next_arg()?.try_as_str()?.split(".");
+    let mut lib_func_name = args.next_arg()?.try_as_str()?.split('.');
 
     let library_name = lib_func_name
         .next()
@@ -1072,7 +1300,7 @@ fn function_call_command(
             args,
             flags: function.flags,
             lib_meta_data: Arc::clone(&lib.gears_lib_ctx.meta_data),
-            allow_block: allow_block,
+            allow_block,
         });
         if matches!(res, FunctionCallResult::Hold) && !allow_block {
             // If we reach here, it means that the plugin violates the API, it blocked the client even though it is not allow to.
@@ -1181,10 +1409,14 @@ fn on_stream_touched(ctx: &Context, _event_type: NotifyEvent, event: &str, key: 
     }
 }
 
-fn generic_notification(_ctx: &Context, _event_type: NotifyEvent, event: &str, key: &[u8]) {
+fn generic_notification(ctx: &Context, _event_type: NotifyEvent, event: &str, key: &[u8]) {
     if event == "del" {
-        let stream_ctx = &mut get_globals_mut().stream_ctx;
-        stream_ctx.on_stream_deleted(event, key);
+        let event = event.to_owned();
+        let key = key.to_vec();
+        ctx.add_post_notification_job(move |_ctx| {
+            let stream_ctx = &mut get_globals_mut().stream_ctx;
+            stream_ctx.on_stream_deleted(&event, &key);
+        });
     }
 }
 
@@ -1300,9 +1532,9 @@ fn on_flush_event(ctx: &Context, flush_event: FlushSubevent) {
 
 #[config_changed_event_handler]
 fn on_config_change(ctx: &Context, values: &[&str]) {
-    if let Some(_) = values
+    if values
         .iter()
-        .find(|v| **v == PSEUDO_SLAVE_READONLY_CONFIG_NAME || **v == PSEUDO_SLAVE_CONFIG_NAME)
+        .any(|v| *v == PSEUDO_SLAVE_READONLY_CONFIG_NAME || *v == PSEUDO_SLAVE_CONFIG_NAME)
     {
         let globals = get_globals_mut();
         globals.db_policy = get_db_policy(ctx);
@@ -1322,7 +1554,7 @@ fn cron_event_handler(ctx: &Context, _hz: u64) {
                 .drain(0..)
                 .filter_map(|v| {
                     let _ = v.upgrade()?;
-                    return Some(v);
+                    Some(v)
                 })
                 .collect();
             if res.is_empty() {
@@ -1344,7 +1576,7 @@ fn cron_event_handler(ctx: &Context, _hz: u64) {
 
 pub(crate) fn verify_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
-        return Err(format!("Empty name is not allowed"));
+        return Err("Empty name is not allowed".to_owned());
     }
     name.chars().try_for_each(|c| {
         if c.is_ascii_alphanumeric() || c == '_' {
@@ -1505,7 +1737,6 @@ mod gears_module {
         allocator: (get_allocator!(), get_allocator!()),
         data_types: [REDIS_GEARS_TYPE],
         init: js_init,
-        info: js_info,
         commands: [],
         event_handlers: [
             [@STREAM: on_stream_touched],
@@ -1518,6 +1749,7 @@ mod gears_module {
                 ["execution-threads", &*EXECUTION_THREADS ,1, 1, 32, ConfigurationFlags::IMMUTABLE, None],
                 ["remote-task-default-timeout", &*REMOTE_TASK_DEFAULT_TIMEOUT , 500, 1, i64::MAX, ConfigurationFlags::DEFAULT, None],
                 ["lock-redis-timeout", &*LOCK_REDIS_TIMEOUT , 500, 100, 1000000000, ConfigurationFlags::DEFAULT, None],
+                ["db-loading-lock-redis-timeout", &*DB_LOADING_LOCK_REDIS_TIMEOUT , 30000, 100, 1000000000, ConfigurationFlags::DEFAULT, None],
 
                 [
                     "v8-maxmemory",
@@ -1559,7 +1791,7 @@ mod gears_module {
             string: [
                 ["gearsbox-address", &*GEARS_BOX_ADDRESS , "http://localhost:3000", ConfigurationFlags::DEFAULT, None],
                 ["v8-plugin-path", &*V8_PLUGIN_PATH , "libredisgears_v8_plugin.so", ConfigurationFlags::IMMUTABLE, None],
-                ["v8-flags", &*V8_FLAGS, "", ConfigurationFlags::IMMUTABLE, None],
+                ["v8-flags", &*V8_FLAGS, "'--noexpose-wasm'", ConfigurationFlags::IMMUTABLE, None],
             ],
             bool: [
                 ["enable-debug-command", &*ENABLE_DEBUG_COMMAND , false, ConfigurationFlags::IMMUTABLE, None],

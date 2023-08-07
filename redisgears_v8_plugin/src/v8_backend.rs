@@ -9,6 +9,7 @@ use redis_module::redisvalue::RedisValueKey;
 use redis_module::RedisValue;
 use redisgears_macros_internals::get_allow_deny_lists;
 use redisgears_plugin_api::redisgears_plugin_api::backend_ctx::BackendCtxInterfaceInitialised;
+use redisgears_plugin_api::redisgears_plugin_api::load_library_ctx::{InfoSectionData, ModuleInfo};
 use redisgears_plugin_api::redisgears_plugin_api::prologue::ApiVersion;
 use redisgears_plugin_api::redisgears_plugin_api::{
     backend_ctx::BackendCtx, backend_ctx::BackendCtxInterfaceUninitialised,
@@ -16,7 +17,7 @@ use redisgears_plugin_api::redisgears_plugin_api::{
     load_library_ctx::LibraryCtxInterface, GearsApiError,
 };
 use v8_rs::v8::isolate_scope::GarbageCollectionJobType;
-use v8_rs::v8::v8_version;
+use v8_rs::v8::{v8_init_platform, v8_version};
 
 use crate::v8_native_functions::{initialize_globals_for_version, ApiVersionSupported};
 use crate::v8_script_ctx::V8ScriptCtx;
@@ -202,6 +203,16 @@ pub(crate) fn get_fatal_failure_policy() -> LibraryFatalFailurePolicy {
     LibraryFatalFailurePolicy::Abort
 }
 
+/// Return the timeout for a script being loaded from an RDB.
+pub(crate) fn gil_rdb_lock_timeout() -> u128 {
+    #[cfg(not(test))]
+    unsafe {
+        (GLOBAL.backend_ctx.as_ref().unwrap().get_rdb_lock_timeout)()
+    }
+    #[cfg(test)]
+    0u128
+}
+
 /// Return the timeout for which a library is allowed to
 /// take the Redis GIL. Once this timeout reached it is
 /// considered a fatal failure.
@@ -264,6 +275,14 @@ pub(crate) fn get_global_option() -> GlobalOptions {
     unsafe { &GLOBAL }.global_options
 }
 
+/// Get the given globals option.
+pub(crate) fn get_v8_flags() -> String {
+    unsafe { &GLOBAL }
+        .backend_ctx
+        .as_ref()
+        .map_or_else(|| "".to_owned(), |v| (v.get_v8_flags)())
+}
+
 /// Return the delta by which we should increase
 /// an isolate memory limit, as long as the max
 /// memory did not yet reached.
@@ -301,7 +320,7 @@ pub(crate) fn bypass_memory_limit() -> bool {
         return true;
     }
     unsafe { GLOBAL.bypassed_memory_limit.as_ref().unwrap() }.store(false, Ordering::Relaxed);
-    return false;
+    false
 }
 
 pub(crate) struct V8Backend {
@@ -330,7 +349,11 @@ fn scan_for_isolates_timeout(script_ctx_vec: &ScriptCtxVec) {
                     // gil is current locked. we should check for timeout.
                     // todo: call Redis back to reply to pings and some other commands.
                     let gil_lock_duration = script_ctx.gil_lock_duration_ms();
-                    let gil_lock_configured_timeout = gil_lock_timeout();
+                    let gil_lock_configured_timeout = if script_ctx.is_being_loaded_from_rdb() {
+                        gil_rdb_lock_timeout()
+                    } else {
+                        gil_lock_timeout()
+                    };
                     if gil_lock_duration > gil_lock_configured_timeout {
                         script_ctx.set_lock_timedout();
                         script_ctx.compiled_library_api.log_warning(&format!("Script locks Redis for about {}ms which is more then the configured timeout {}ms.", gil_lock_duration, gil_lock_configured_timeout));
@@ -359,10 +382,12 @@ fn check_isolates_memory_limit(
         if !detected_memory_pressure {
             log_warning("Detects OOM state on the JS engine, will send memory pressure notification to all libraries.");
         }
-        script_ctx_vec.lock().unwrap().iter().for_each(|v| {
-            v.upgrade()
-                .map(|v| v.isolate.memory_pressure_notification());
-        });
+        script_ctx_vec
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.upgrade())
+            .for_each(|v| v.isolate.memory_pressure_notification());
         true
     } else {
         if detected_memory_pressure {
@@ -386,7 +411,7 @@ impl V8Backend {
         }
     }
 
-    fn initialize_v8_engine(&self, flags: &str) -> Result<(), GearsApiError> {
+    fn initialize_v8_engine(&self) -> Result<(), GearsApiError> {
         v8_init_with_error_handlers(
             Box::new(|line, msg| {
                 let msg = format!("v8 fatal error on {}, {}", line, msg);
@@ -406,8 +431,6 @@ impl V8Backend {
                 }
                 panic!("{}", msg);
             }),
-            1,
-            Some(flags),
         )
         .map_err(GearsApiError::new)
     }
@@ -435,16 +458,7 @@ impl BackendCtxInterfaceUninitialised for V8Backend {
         "js"
     }
 
-    fn initialize(
-        self: Box<Self>,
-        backend_ctx: BackendCtx,
-    ) -> Result<Box<dyn BackendCtxInterfaceInitialised>, GearsApiError> {
-        let flags = (backend_ctx.get_v8_flags)();
-        let flags = if flags.starts_with("'") && flags.len() > 1 {
-            &flags[1..flags.len() - 1]
-        } else {
-            &flags
-        };
+    fn on_load(&self, backend_ctx: BackendCtx) -> Result<(), GearsApiError> {
         unsafe {
             GLOBAL.backend_ctx = Some(backend_ctx);
             GLOBAL.bypassed_memory_limit = Some(AtomicBool::new(false));
@@ -467,7 +481,20 @@ impl BackendCtxInterfaceUninitialised for V8Backend {
             }
         }));
 
-        self.initialize_v8_engine(&flags)?;
+        let flags = get_v8_flags();
+        let flags = if flags.starts_with('\'') && flags.len() > 1 {
+            &flags[1..flags.len() - 1]
+        } else {
+            &flags
+        };
+
+        v8_init_platform(1, Some(flags)).map_err(GearsApiError::new)
+    }
+
+    fn initialize(
+        self: Box<Self>,
+    ) -> Result<Box<dyn BackendCtxInterfaceInitialised>, GearsApiError> {
+        self.initialize_v8_engine()?;
         self.spawn_background_maintenance_thread()?;
 
         Ok(self)
@@ -549,6 +576,7 @@ impl BackendCtxInterfaceInitialised for V8Backend {
                 tensor_obj_template,
                 compiled_library_api,
             ));
+
             let len = {
                 let mut l = self.script_ctx_vec.lock().unwrap();
                 l.push(Arc::downgrade(&script_ctx));
@@ -582,7 +610,7 @@ impl BackendCtxInterfaceInitialised for V8Backend {
 
                         let msg = format!("{msg}, library={}, used_heap_size={}, total_heap_size={}", script_ctx.name, script_ctx.isolate.used_heap_size(), script_ctx.isolate.total_heap_size());
                         let memory_delta = memory_delta();
-                        let new_isolate_limit = (usize::max(script_ctx.isolate.total_heap_size(), curr_limit) + memory_delta) as usize;
+                        let new_isolate_limit = usize::max(script_ctx.isolate.total_heap_size(), curr_limit) + memory_delta;
 
                         if calc_isolates_used_memory() + memory_delta >= max_memory_limit() {
                             unsafe { GLOBAL.bypassed_memory_limit.as_ref().unwrap() }.store(true, Ordering::Relaxed);
@@ -728,5 +756,51 @@ impl BackendCtxInterfaceInitialised for V8Backend {
                 "Unknown subcommand '{sub_command}'",
             ))),
         }
+    }
+
+    fn get_info(&mut self) -> Option<ModuleInfo> {
+        let sections = {
+            let aggregated_libraries_stats = InfoSectionData::KeyValuePairs({
+                let (active, not_active) = {
+                    let l = self.script_ctx_vec.lock().unwrap();
+                    let active = l.iter().filter(|v| v.strong_count() > 0).count() as i64;
+                    let not_active = l.iter().filter(|v| v.strong_count() == 0).count() as i64;
+                    (active, not_active)
+                };
+
+                let mut data = HashMap::new();
+                data.insert("active".to_owned(), active.to_string());
+                data.insert("not_active".to_owned(), not_active.to_string());
+                data.insert(
+                    "combined_memory_limit".to_owned(),
+                    calc_isolates_used_memory().to_string(),
+                );
+
+                {
+                    let l = self.script_ctx_vec.lock().unwrap();
+                    let (total_heap_size, used_heap_size) = l
+                        .iter()
+                        .filter_map(|v| v.upgrade())
+                        .fold((0, 0), |mut acc, v| {
+                            acc.0 += v.isolate.total_heap_size();
+                            acc.1 += v.isolate.used_heap_size();
+                            acc
+                        });
+
+                    data.insert("total_heap_size".to_owned(), total_heap_size.to_string());
+                    data.insert("used_heap_size".to_owned(), used_heap_size.to_string());
+                }
+
+                data
+            });
+
+            let mut sections = HashMap::new();
+            sections.insert(
+                "V8AggregatedLibraryStatistics".to_owned(),
+                aggregated_libraries_stats,
+            );
+            sections
+        };
+        Some(ModuleInfo { sections })
     }
 }

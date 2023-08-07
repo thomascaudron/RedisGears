@@ -60,7 +60,7 @@ def testNoRegistrations(env):
     script = '''#!js api_version=1.0 name=foo
 
     '''
-    env.expect('TFUNCTION', 'LOAD', 'REPLACE', script).error().contains("No function nor registrations was registered")
+    env.expect('TFUNCTION', 'LOAD', 'REPLACE', script).error().contains("Neither function nor other registrations were found")
 
 @gearsTest()
 def testBlockRedisTwice(env):
@@ -566,3 +566,11 @@ redis.registerClusterFunction("test.test", async (client) => {
 });
     '''
     env.expect('TFUNCTION', 'LOAD', code).error().contains('Unallowed cluster function name \'test.test\'')
+
+
+@gearsTest()
+def testWasmIsNotExposeByDefault(env):
+    code = '''#!js api_version=1.0 name=foo
+WebAssembly.Global
+    '''
+    env.expect('TFUNCTION', 'LOAD', code).error().contains('WebAssembly is not defined')
